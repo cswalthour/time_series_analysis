@@ -1,0 +1,561 @@
+---
+output:
+  pdf_document: default
+  html_document: 
+    highlight: tango
+---
+Installing the necessary packages to run code.
+
+```{r, results='hide', message=F, warning=F, error=FALSE}
+# packages to load
+libraries <- c("dplyr", "lubridate", "tidyr", "pbapply", "purrr",
+               "zoo", "tibble", "xts", "forecast", "season", "broom",
+               "bigrquery", "stringr", "odbc", "devtools", "readxl")
+
+# deploy packages into environment
+lapply(libraries, require, character.only = TRUE)
+
+```
+Next, inspect base R version installed.
+
+```{r, message=F, warning=F, error=FALSE}
+sessionInfo()
+
+```
+Below is an example time series with missing dates to simulate how to approach completing the entirety of a time series in order to apply seasonality functions. At the bottom of the code chunk, however, is the setup code to ingest data from GCP BQ (but is purposefully commented to run when executing the code). 
+
+```{r, message=F, warning=F, error=FALSE}
+
+# Creating tibble with last 4 years of weekly dates with 3 distinct products
+random_dates <- bind_cols(tibble(start_date = seq.Date(from = floor_date(Sys.Date()-(365.25*4),
+                                                               "week")+1,
+                                                    to = floor_date(Sys.Date(),
+                                                               "week")+1, by = "week")),
+                           tibble(products = list(c('A', 'B', 'C')))) %>%
+  unnest() %>%
+  group_by(products) %>%
+  nest() %>%
+  ungroup()
+
+# Adding random demand data drawn from normal distribution
+demand_tbl <- random_dates %>%
+  mutate(data = pblapply(data, function(x){
+    
+    tbl <- x %>%
+      unnest()
+    
+    new_data_tbl <- bind_cols(tbl, 
+                              tibble(demand_qty = rnorm(nrow(tbl),
+                                                        mean = 100, sd = 15)))
+  return(new_data_tbl)    
+    
+  })) %>%
+  unnest() %>%
+  mutate(demand_qty = round(demand_qty, digits = 2))
+
+# Purposefully removing weekly dates and demand data to illustrate point
+demand_tbl_2 <- demand_tbl %>%
+  group_by(products) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(data = pblapply(data, function(x){
+    
+    tbl <- x %>%
+      unnest() %>%
+      slice(1:100, 102:200, 206:n())
+    
+    return(tbl)
+    
+  })) %>%
+  unnest() %>%
+  mutate(products = as.factor(products))
+
+# Showing summary view of tibble
+summary(demand_tbl_2)
+
+```
+
+The next code chunk attempts to complete the time series due to missing dates from above.
+
+```{r, message=F, warning=F, error=FALSE}
+
+#Invoking complete function to complete the date feature
+demand_tbl_corrected <- demand_tbl_2 %>%
+  group_by(products) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(data = pblapply(data, function(x){
+    
+    tbl <- x %>%
+      unnest() %>%
+      complete(start_date = seq.Date(from = min(start_date),
+                                     to = floor_date(Sys.Date(),
+                                                     unit = "week")+1,
+                                     by = "week"))
+    
+    return(tbl)
+    
+  })) %>%
+  unnest()
+
+# Checking for NA's
+summary(demand_tbl_corrected)
+
+# Imputing missing demand_qty values with 0
+demand_tbl_corrected <- demand_tbl_corrected %>%
+  group_by(products) %>%
+  mutate(demand_qty = ifelse(is.na(demand_qty), 0, 
+                             demand_qty)) %>%
+  ungroup()
+
+# Checking for NA's
+summary(demand_tbl_corrected)
+
+```
+
+Now that we have a complete time series we can begin applying time series functions. 
+
+But first we're going to check for "Intermittency" in demand. Based on experience, I defined this term by if any particular SKU has over 18 weeks of zero demand during a given year, this SKU would be earmarked as **"Intermittent."** This is a feature that would filter out any "qualified" SKUs that will go under future seasonality feature determination (i.e. seasonality functions).
+
+```{r, message=F, warning=F, error=FALSE}
+# Deploying function to count number of total and consecutive weeks
+# per calendar year a SKU had zero demand recorded
+demand_tbl_corrected_2 <- demand_tbl_corrected %>%
+  mutate(year = year(start_date)) %>%
+  group_by(products) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(data = pblapply(data, function(x){
+    
+    tbl <- x %>%
+      unnest()
+    
+    tbl_2 <- tbl %>%
+      arrange(start_date) %>%
+      mutate(zero_week = ifelse(demand_qty == 0, 1, 0)) %>%
+      group_by(year) %>%
+      nest() %>%
+      mutate(data = pblapply(data, function(x){
+        
+        data <- x %>%
+          unnest()
+              
+        data_2 <- data %>%
+          mutate(zero_week_cumsum = cumsum(zero_week)) %>%
+          mutate(zero_week_consec = ifelse(lag(zero_week, 1) == 1 & zero_week == 1,
+                                           lag(zero_week, 1) + 1, 0)) %>%
+          mutate(zero_week_consec = ifelse(is.na(zero_week_consec), 0, zero_week_consec))
+              
+        return(data_2)
+        
+        })) %>%
+      unnest()
+    
+    year <- tbl_2 %>%
+      group_by(year) %>%
+      summarise(total_zero_weeks = max(zero_week_cumsum),
+                long_consec_weeks = max(zero_week_consec)) %>%
+      mutate(intermittent = ifelse(total_zero_weeks >= 18, "YES", "NO")) %>%
+      filter(year %in% c(2019, 2020, 2021)) %>%
+      pivot_wider(names_from = year,
+                  values_from = c(intermittent, total_zero_weeks, long_consec_weeks))
+          
+    result <- tbl_2 %>%
+      dplyr::select(-starts_with("zero")) %>%
+      dplyr::bind_cols(year)
+    
+    return(result)
+    
+  })) %>%
+  unnest()
+
+# Inspecting working tibble to ensure new intermmitency features were added
+summary(demand_tbl_corrected_2)
+
+```
+
+The next code chunk reflects aggregating weekly demand to a monthly level so that the seasonality functions can evaluate at a monthly level to understand the significance of that signal from that perspective.
+
+```{r, results='hide', message=F, warning=F, error=FALSE}
+
+# Aggregating weekly demand by month
+demand_tbl_monthly <- demand_tbl_corrected_2 %>%
+  mutate(month_date = ymd(paste0(year(start_date),"-", month(start_date),
+                                 "-01"))) %>%
+  group_by(products, month_date, year, intermittent_2021, intermittent_2020,
+           intermittent_2019, total_zero_weeks_2021, total_zero_weeks_2020,
+           total_zero_weeks_2019, long_consec_weeks_2021, long_consec_weeks_2020,
+           long_consec_weeks_2019) %>%
+  summarise(demand_qty = sum(demand_qty)) %>%
+  ungroup()
+
+```
+
+Before deploying all of the seasonality functions against the monthly product demand data, the below reflects a demonstration regarding how to inspect the components of a time series below. This remains to be an important concept to understand the seasonality features produced for interpretation.
+
+```{r, message=F, warning=F, error=F, attr.source='.numberLines'}
+
+# Converting demand into ts objects
+demand_tbl_monthly_ts <- demand_tbl_monthly %>%
+  group_by(products) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(data = pblapply(data, function(x){
+    
+    tbl <- x %>%
+      unnest() %>%
+      dplyr::select(demand_qty, month_date)
+    
+    ts <- ts(tbl$demand_qty, frequency = 12, 
+                start = c(year(min(tbl$month_date)), 
+                             month(min(tbl$month_date))),
+     end = c(year(max(tbl$month_date)), 
+                             month(max(tbl$month_date))))
+    
+    return(ts)
+    
+  }))
+
+# Dissecting each product's time series components
+pblapply(demand_tbl_monthly_ts$data, function(x){
+  
+  stl(x, t.window = 13, s.window = "periodic", robust = TRUE) %>%
+    autoplot()
+  
+})
+
+# Inspecting each component of ts using STL decomposition, but only
+# for first time series (Product A)
+tbl_decomp <- demand_tbl_monthly_ts %>%
+  slice(1) %>%
+  dplyr::select(data) %>%
+  mutate(data = pblapply(data, function(x){
+    
+    stl_results <- stl(x, s.window="periodic", na.action = na.contiguous)
+    
+    stl_results <- stl_results[["time.series"]] %>% as.data.frame()
+    
+    return(stl_results)
+      
+  })) %>%
+  unnest()
+
+# Inspect first five rows
+head(tbl_decomp)
+
+```
+
+What the above visualizations represent are the individual components of a time series, which we can deconstruct to measure the significance of the seasonality signal and create a metric around. Furthermore, **Lines 1-18** above show how to extract the various time series components of the STL decomposition.
+
+For more information regarding this approach please see the following resource:
+
+[link](https://otexts.com/fpp2/stl.html)
+
+Now, the next chunk represents applying functions to understand the time series characteristics of the demand per product by month notwithstanding just "seasonality." 
+
+```{r, results='hide', message=F, warning=F, error=FALSE, attr.source='.numberLines'}
+
+# Apply time series characteristics function to each product's time series
+demand_tbl_monthly_2 <- demand_tbl_monthly %>%
+  group_by(products) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(data = pblapply(data, function(x){
+    
+    tbl <- x %>%
+      unnest()
+    
+    # Converting demand to time series structure
+    ts <- ts(tbl$demand_qty, frequency = 12, 
+                start = c(year(min(tbl$month_date)), 
+                             month(min(tbl$month_date))),
+     end = c(year(max(tbl$month_date)), 
+                             month(max(tbl$month_date))))
+    
+    # Defining seasonality measures functions
+      decomp <- function(x, transform=TRUE) {
+        
+        require(forecast)
+        # Transform series in case not all observations appears (from ts)
+        # derived from a normal distribution. Also, Box-Cox transforms ensure
+        # that all ts observations have the same variance
+        if(transform & min(x, na.rm=TRUE) >= 0)
+          {lambda <- BoxCox.lambda(na.contiguous(x))
+          
+          x <- BoxCox(x, lambda)
+          }
+          else
+          {
+            lambda <- NULL
+            transform <- FALSE
+          }
+          # Seasonal data investigation
+          # Perform STL decomposition and extract trend, seasonal, and
+          # remainder components (similar to Lines 228-240 above)
+          if(frequency(x)>1)
+          {
+            x.stl <- stl(x, s.window="periodic", na.action = na.contiguous)
+            trend <- x.stl[["time.series"]][,2]
+            season <- x.stl[["time.series"]][,1]
+            remainder <- x - trend - season
+          }
+          else #Nonseasonal data
+          {
+            require(mgcv) # Library of functions necessary for imputing
+                          # non-seasonal data
+            
+            # Creating numeric vector for length of ts object
+            tt <- 1:length(x)
+            # Constructing vector of NA for length of ts object
+            trend <- rep(NA,length(x))
+            # Fitting generalized additive model for all non-NA values from
+            # original ts object
+            trend[!is.na(x)] <- fitted(gam(x ~ s(tt)))
+            season <- NULL
+            remainder <- x - trend
+          }
+        
+        # Defining list object as resulting data structure to house
+        # all time series decomposition values
+          return(list(x=x, trend=trend, season=season, remainder=remainder,
+                      transform=transform, lambda=lambda))
+        }
+        
+        # f1 maps [0,infinity) to [0,1]
+        f1 <- function(x, a, b)
+        {
+          eax <- exp(a*x)
+          if (is.infinite(eax))
+            f1eax <- 1
+          else
+            f1eax <- (eax-1)/(eax+b)
+          return(f1eax)
+        }
+        
+        # f2 maps [0,1] onto [0,1]
+        f2 <- function(x,a,b)
+        {
+          eax <- exp(a*x)
+          ea <- exp(a)
+          return((eax-1)/(eax+b)*(ea+b)/(ea-1))
+        }
+        
+        # Beginning of measures function that will be used to produce 
+        # informative features about each product's time series
+        measures <- function(x){
+          print("starting 'measures' function")
+          require(forecast)
+          
+          # Determining length of time series object
+          N <- length(x)
+          
+          # Defining periodcity of time series since it's monthly
+          freq <- 12L
+          
+          # Re-scaling frequency according to transformation below
+          fx <- c(frequency=(exp((freq-1)/50)-1)/(1+exp((freq-1)/50)))
+          
+          # Re-stating ts object
+          x <- ts(x, f=freq)
+          
+          # Decomposition function defined above applied to ts object now
+          # and results now fitted to list object
+          decomp.x <- decomp(x)
+          
+          # Adjust data depending on frequency of time series
+          if(freq > 1){
+            fits <- decomp.x[["trend"]] + decomp.x[["season"]]
+          }else{fits <- decomp.x[["trend"]]} # Nonseasonal data 
+          
+          # Creating new time series object subtracting both the seasonal
+          # and trend components of time series; however, this will add back only
+          # the mean trend component into new time series
+          adj.x <- decomp.x[["x"]] - fits + mean(decomp.x[["trend"]], na.rm=TRUE)
+          
+          # Backtransformation of adjusted data, if necessary
+          if(decomp.x[["transform"]])
+            tadj.x <- InvBoxCox(adj.x, decomp.x[["lambda"]])
+          else
+            tadj.x <- adj.x
+          
+          # Extracting trend and seasonal measures, but first defining
+          # Variance of adjusted time series
+          v.adj <- var(adj.x, na.rm=TRUE)
+          
+          # Creating trend and seasonal objects
+          if(freq > 1){
+            # Subtract trend element
+            detrend <- decomp.x[["x"]] - decomp.x[["trend"]]
+            
+            # Subtract seasonal element
+            deseason <- decomp.x[["x"]] - decomp.x[["season"]]
+            
+            # Scaling trend component between 0 and 1 depending if
+            # variance of de-seasoned time series is below 1e-10
+            trend <- ifelse(var(deseason, na.rm=TRUE) < 1e-10, 0, 
+                            max(0, min(1, 1-v.adj/var(deseason, na.rm=TRUE))))
+            
+            # Scaling seasonal component between 0 and 1 depending if
+            # variance of de-trened time series is below 1e-10
+            season <- ifelse(var(detrend, na.rm=TRUE) < 1e-10, 0,
+                             max(0, min(1, 1-v.adj/var(detrend, na.rm=TRUE))))
+          }else{
+            trend <- ifelse(var(decomp.x[["x"]],na.rm=TRUE) < 1e-10, 0,
+                            max(0,min(1,1-v.adj/var(decomp.x[["x"]],na.rm=TRUE))))
+            season <- 0
+          }#Nonseasonal data
+          
+          # Measures on original data
+          xbar <- mean(x, na.rm=TRUE)
+          s <- sd(x, na.rm=TRUE)
+          
+          # Skewness
+          sk <- abs(mean((x-xbar)^3,na.rm=TRUE)/s^3)
+          fs <- f1(sk,1.510,5.993)
+          
+          # Kurtosis
+          k <- mean((x-xbar)^4,na.rm=TRUE)/s^4
+          fk <- f1(k,2.273,11567)
+          
+          # Creating resulting tibble enclosing all newly-formed time series
+          # measures
+          measures <- tibble(frequency = fx, trend = trend, seasonal = season,
+                             skewness = fs, kurtosis = fk)
+          
+          print("ending 'measures' function")
+          
+          # Error catching provision to ensure that code will not break across
+          # Products
+          return(tryCatch(measures, error = function(e) {print("error occurred")}))
+        }
+        
+        # Final function to produce resulting tibble to append to original data
+        eligible <- function(x){if(length(x)<=24){
+          tibble(frequency = 0, trend = 0, seasonal = 0, skewness = 0, kurtosis = 0)}
+          else{measures(x)}
+        }
+        
+        # Returning final tibble structure inclusive of original data along
+        # with newly-produced time series characteristics' features
+        return(bind_cols(tbl, eligible(ts)))
+    
+  }))
+
+```
+
+To summarize, the above code chunk accomplishes the following:
+
+* Extract time series components to undergo future evaluation of its components (see **Lines 19-65**)
+
+* Use extracted time series components to inspect whether attributes of **"trend"** or **"seasonal" ** are significant as compared against the transformed time series. The transformed time series is the function of the remaining time series components after removing the mean trend values (see **Line 116**). This includes the following steps when scaling:
+
+  + **Trend**: Determining the maximum value between 0 and 1 minus the transformed time series (defined above) divided by the raw trend component (see **Lines 138-139**)
+  
+  + **Seasonal**: Determining the maximum value between 0 and 1 minus the transformed time series (defined above) divided by the raw seasonal component (see **Lines 143-144**)
+
+Ultimately, though, these measures - along with Frequency, Skewness, and Kurtosis - will be joined with the original monthly time series data.
+
+For more information about the use of "time series characteristics" as features to inspect about the similarity or dissimilarity of demand, please see the below link:
+
+[link](https://robjhyndman.com/hyndsight/tscharacteristics/)
+
+The next code chunk attempts to measure (1) the statistical significance of the seasonal component when applied to ETS forecasting function and (2) a quality of demand smoothness.
+
+```{r, results='hide', message=F, warning=F, error=FALSE, attr.source='.numberLines'}
+
+# Apply time series characteristics function to each product's time series
+demand_tbl_monthly_3 <- demand_tbl_monthly_2 %>%
+  mutate(data = pblapply(data, function(x){
+    
+    tbl <- x %>%
+      unnest()
+    
+     # Converting demand to time series structure
+    ts <- ts(tbl$demand_qty, frequency = 12, 
+                start = c(year(min(tbl$month_date)), 
+                             month(min(tbl$month_date))),
+     end = c(year(max(tbl$month_date)), 
+                             month(max(tbl$month_date))))
+    
+    # Function to test ETS model with and without Seasonal Component
+    seas_comp_test <- function(x){
+      
+      fit1 <- ets(x)
+      fit2 <- ets(x, model = "ANN")
+      
+      deviance <- 2*c(logLik(fit1) - logLik(fit2))
+      
+      df <- attributes(logLik(fit1))$df - attributes(logLik(fit2))$df
+      
+      return(round(1-pchisq(deviance, df), digits = 5))
+      
+    }
+    
+    # Detecting line smoothness using autocorrelation
+    smoothness <- cor(tbl$demand_qty[-length(tbl$demand_qty)], tbl$demand_qty[-1]) %>%
+      as.numeric()
+    
+    return(bind_cols(tbl, tibble(pchisq_test = seas_comp_test(ts)),
+                     tibble(smoothness = smoothness)))
+
+  }))
+
+```
+
+The first function that is applied to each monthly time series object is a test of statistical significance using a chi-square distributions (see **Lines 16 - 27** above). For more information regarding this test, please see the below link:
+
+[link](https://robjhyndman.com/hyndsight/detecting-seasonality/)
+
+The second function applied to each time series is a "lag-one autocorrelation," determined to understand the line smoothness of demand between the range of -1 to 1. For more information regarding this test and interpretability, please see the below link:
+
+[link](https://stats.stackexchange.com/questions/24607/how-to-measure-smoothness-of-a-time-series-in-r)
+
+The next function applies a cosinor model to each time series in order to determine the low and high month point, respectively, if there were to be seasonal event. 
+
+```{r, results='hide', message=F, warning=F, error=FALSE, attr.source='.numberLines'}
+
+# Apply time series characteristics function to each product's time series
+demand_tbl_monthly_4 <- demand_tbl_monthly_3 %>%
+  mutate(data = pblapply(data, function(x){
+    
+    tbl <- x %>%
+      unnest() %>%
+      mutate(month = month(month_date))
+    
+    # Function to extract both high and low seasonal months from cosinor model
+    seasonal_point <- function(x){
+      
+      res <- cosinor(demand_qty ~ 1, date = 'month',
+                     data = x %>% as.data.frame(), type = 'monthly', family = poisson(),
+                     offsetmonth = TRUE) %>%
+        summary(.) %>%
+        .[["phase"]]
+      
+      res_2 <- cosinor(demand_qty ~ 1, date = 'month',
+                     data = x %>% as.data.frame(), type = 'monthly', family = poisson(),
+                     offsetmonth = TRUE) %>%
+        summary(.) %>%
+        .[["lphase"]]
+      
+      tbl_2 <- tibble(high_month = res, low_month = res_2) %>%
+        mutate(high_month = round(as.numeric(gsub("Month = ", "", high_month)),
+                                  digits = 0)) %>%
+         mutate(low_month = round(as.numeric(gsub("Month = ", "", low_month)),
+                                  digits = 0)) %>%
+        mutate_at(vars(high_month, low_month), function(x){ifelse(x>12, 12, x)})
+      
+      return(tbl_2)
+      
+    }
+    
+    return(bind_cols(tbl %>% dplyr::select(-month), seasonal_point(tbl)))
+
+  }))
+
+```
+
+What the function above accomplishes (see **Lines 10 - 33** above) is that it applies a seasonal model in which a "sinusoidal pattern" is given consideration. This pattern, in effect, is measured by the *A* or *Amplitude*, *P* or *Phase*, *C* or *Length*, *T* or *Time of Each Observation*, and *N* being the *number of observations* of the time series. These terms can be extracted to approximate the monthly phases of high and low seasonality. For more information regarding this test, please see the below link (pages 7-8):
+
+[link](https://journal.r-project.org/archive/2012/RJ-2012-001/RJ-2012-001.pdf)
+
+Ultimately, the working tibble structure now contains extracted time series characteristics from each product's demand that can be added as features to the existing structure to vizualize in the IDE of your choice.
